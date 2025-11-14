@@ -1,0 +1,721 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CGPA Tracker & Secure Login</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { 
+            getAuth, 
+            createUserWithEmailAndPassword, 
+            signInWithEmailAndPassword, 
+            signOut,
+            onAuthStateChanged 
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { 
+            getFirestore, 
+            doc, 
+            getDoc,
+            addDoc, 
+            setDoc,
+            deleteDoc, 
+            onSnapshot, 
+            collection, 
+            query, 
+            orderBy, 
+            setLogLevel 
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Global variables provided by the environment
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+
+        let db, auth, userId = null;
+        let userProfile = null;
+        let authReady = false; // Flag to ensure functions don't run before init
+
+        const gradeMap = {
+            'S': 10, 'A': 9, 'B': 8, 'C': 7, 'D': 6, 'E': 5, 'P': 4, 'F': 0, 'I': 0, 'W': 0
+        };
+
+        setLogLevel('Debug');
+
+        // --- UI Visibility Handlers ---
+        
+        function showAuthUI(isLogin = true) {
+            document.getElementById('main-app-container').classList.add('hidden');
+            document.getElementById('auth-container').classList.remove('hidden');
+            
+            // Set up form mode
+            const authTitle = document.getElementById('auth-title');
+            const toggleLink = document.getElementById('auth-toggle-link');
+            const formFields = document.getElementById('signup-fields');
+            const submitButton = document.getElementById('auth-submit-btn');
+
+            if (isLogin) {
+                authTitle.textContent = 'Login to your Account';
+                toggleLink.innerHTML = "Don't have an account? <span class='font-bold hover:text-indigo-700 cursor-pointer'>Sign Up</span>";
+                formFields.classList.add('hidden');
+                submitButton.textContent = 'Login';
+                submitButton.onclick = handleLogin;
+                toggleLink.onclick = () => showAuthUI(false);
+            } else {
+                authTitle.textContent = 'Create a New Account';
+                toggleLink.innerHTML = "Already have an account? <span class='font-bold hover:text-indigo-700 cursor-pointer'>Login</span>";
+                formFields.classList.remove('hidden');
+                submitButton.textContent = 'Sign Up';
+                submitButton.onclick = handleSignUp;
+                toggleLink.onclick = () => showAuthUI(true);
+            }
+            document.getElementById('auth-message').textContent = '';
+        }
+
+        function showMainApp(profile) {
+            document.getElementById('auth-container').classList.add('hidden');
+            document.getElementById('main-app-container').classList.remove('hidden');
+            userProfile = profile;
+            
+            userId = auth.currentUser.uid;
+            document.getElementById('user-id-display').textContent = `User ID: ${userId}`;
+            document.getElementById('profile-info').innerHTML = `
+                <p class="text-gray-700 font-semibold">${profile.name} (${profile.regNo})</p>
+                <p class="text-sm text-gray-500">${profile.email}</p>
+            `;
+            // Only start listening when the user is genuinely logged in via Email/Password
+            startListeningForCourses();
+        }
+
+        /**
+         * Initializes Firebase and sets up services.
+         */
+        async function initializeFirebase() {
+            try {
+                if (Object.keys(firebaseConfig).length === 0) {
+                    console.error("Firebase configuration is missing.");
+                    document.getElementById('app-status').textContent = "Error: Firebase configuration is missing.";
+                    showAuthUI();
+                    return;
+                }
+
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                authReady = true; // Mark services as initialized
+
+                // Check for existing signed-in user (from a previous session)
+                onAuthStateChanged(auth, async (user) => {
+                    if (user && user.email) { // Check for user signed in via email/password
+                        userId = user.uid;
+                        document.getElementById('app-status').textContent = 'Authenticated';
+                        await loadUserProfile(userId);
+                        showMainApp(userProfile);
+                    } else {
+                         document.getElementById('app-status').textContent = 'Ready to Login/Sign Up';
+                         showAuthUI(); // Show login screen if no user is signed in
+                    }
+                });
+
+            } catch (error) {
+                console.error("Firebase initialization failed:", error);
+                document.getElementById('app-status').textContent = `Initialization Error: ${error.message}`;
+            }
+        }
+        
+        // --- Authentication Handlers ---
+
+        function getAuthFields() {
+            // Note: Since the Login form reuses the Sign Up fields, we must safely check them
+            const nameInput = document.getElementById('signup-name');
+            const regNoInput = document.getElementById('signup-regno');
+
+            const name = nameInput ? nameInput.value.trim() : '';
+            const regNo = regNoInput ? regNoInput.value.trim() : '';
+            const email = document.getElementById('auth-email').value.trim();
+            const password = document.getElementById('auth-password').value;
+            return { name, regNo, email, password };
+        }
+
+        async function saveUserProfile(uid, name, regNo, email) {
+            try {
+                const profileDocPath = `artifacts/${appId}/userProfiles/${uid}`;
+                await setDoc(doc(db, profileDocPath), {
+                    name,
+                    regNo,
+                    email,
+                    createdAt: Date.now()
+                });
+                console.log("User profile saved successfully.");
+            } catch (error) {
+                console.error("Error saving user profile:", error);
+                // Important: Show error but proceed, as the user is already created in Auth
+                showModal("Profile Save Error", `Your account was created, but failed to save profile details: ${error.message}. Please contact support.`);
+            }
+        }
+        
+        async function loadUserProfile(uid) {
+             try {
+                const profileDocPath = `artifacts/${appId}/userProfiles/${uid}`;
+                const docSnap = await getDoc(doc(db, profileDocPath));
+                if (docSnap.exists()) {
+                    userProfile = docSnap.data();
+                } else {
+                    console.warn("User profile not found in database.");
+                    // Set a placeholder profile if not found
+                    userProfile = { name: 'Unknown User', regNo: 'N/A', email: auth.currentUser.email || 'N/A' };
+                }
+            } catch (error) {
+                console.error("Error loading user profile:", error);
+                userProfile = { name: 'Error Loading', regNo: 'N/A', email: 'N/A' };
+            }
+        }
+
+        window.handleSignUp = async function() {
+            if (!authReady) {
+                 document.getElementById('auth-message').textContent = 'Error: App is initializing. Please wait a moment.';
+                 return;
+            }
+            const { name, regNo, email, password } = getAuthFields();
+            const messageElement = document.getElementById('auth-message');
+            messageElement.textContent = 'Signing up...';
+            console.log("Attempting sign-up for:", email);
+
+            if (!name || !regNo || !email || !password) {
+                messageElement.textContent = 'Error: All fields (Name, Reg No., Email, Password) are mandatory.';
+                return;
+            }
+            if (password.length < 6) {
+                messageElement.textContent = 'Error: Password must be at least 6 characters long.';
+                return;
+            }
+            
+            try {
+                const userCredential = await createUserWithEmailAndPassword(auth, email, password);
+                console.log("Sign up successful. UID:", userCredential.user.uid);
+                
+                // Save profile details immediately
+                await saveUserProfile(userCredential.user.uid, name, regNo, email);
+                
+                // Show Main App directly after successful sign up
+                await loadUserProfile(userCredential.user.uid);
+                showMainApp(userProfile);
+
+            } catch (error) {
+                console.error("Sign-up failed:", error);
+                let errorMessage = error.message;
+                if (error.code === 'auth/email-already-in-use') {
+                    errorMessage = 'This email is already in use. Try logging in.';
+                } else if (error.code === 'auth/invalid-email') {
+                    errorMessage = 'Invalid email address.';
+                } else if (error.code === 'auth/operation-not-allowed') {
+                    errorMessage = 'Email/Password sign-up is disabled. Please enable it in your Firebase project\'s Authentication settings.';
+                }
+                messageElement.textContent = `Sign-up Error: ${errorMessage}`;
+            }
+        }
+
+        window.handleLogin = async function() {
+            if (!authReady) {
+                 document.getElementById('auth-message').textContent = 'Error: App is initializing. Please wait a moment.';
+                 return;
+            }
+            const { email, password } = getAuthFields();
+            const messageElement = document.getElementById('auth-message');
+            messageElement.textContent = 'Logging in...';
+            console.log("Attempting login for:", email);
+
+            if (!email || !password) {
+                messageElement.textContent = 'Error: Email and Password are required for login.';
+                return;
+            }
+
+            try {
+                const userCredential = await signInWithEmailAndPassword(auth, email, password);
+                console.log("Login successful. UID:", userCredential.user.uid);
+                
+                // Show Main App directly after successful login
+                await loadUserProfile(userCredential.user.uid);
+                showMainApp(userProfile);
+
+            } catch (error) {
+                console.error("Login failed:", error);
+                let errorMessage = error.message;
+                if (error.code === 'auth/invalid-credential' || error.code === 'auth/user-not-found' || error.code === 'auth/wrong-password') {
+                    errorMessage = 'Invalid email or password.';
+                } else if (error.code === 'auth/operation-not-allowed') {
+                     errorMessage = 'Email/Password login is disabled. Please enable it in your Firebase project\'s Authentication settings.';
+                }
+                messageElement.textContent = `Login Error: ${errorMessage}`;
+            }
+        }
+
+        window.handleSignOut = async function() {
+            try {
+                await signOut(auth);
+                // The onAuthStateChanged listener will handle the UI switch after sign out
+            } catch (error) {
+                console.error("Sign-out failed:", error);
+                showModal("Sign Out Error", `Failed to sign out: ${error.message}`);
+            }
+        }
+        
+        // --- Data Export Handler (Replaces "Send to me as an excel file") ---
+
+        window.exportUserProfile = function() {
+            if (!userProfile) {
+                showModal("Error", "User profile data is not available for export.");
+                return;
+            }
+
+            // Prepare CSV content
+            const headers = ["Name", "Registration Number", "Email ID", "User ID"];
+            const data = [
+                userProfile.name,
+                userProfile.regNo,
+                userProfile.email,
+                userId // Include the unique Firebase user ID
+            ];
+
+            const csvContent = headers.join(',') + '\n' + data.map(d => `"${d}"`).join(',');
+            
+            // Create a Blob and a download link
+            const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+            const link = document.createElement("a");
+            const url = URL.createObjectURL(blob);
+            
+            link.setAttribute("href", url);
+            link.setAttribute("download", `${userProfile.regNo}_Profile_Data.csv`);
+            
+            // Append to body, click, and remove
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            
+            showModal("Success", "Your profile data has been downloaded as a CSV file.");
+        }
+
+
+        // --- CGPA/GPA Logic (Rest of the original functions remain the same) ---
+        
+        /**
+         * Calculates GPA and CGPA from the list of courses.
+         * @param {Array<Object>} courses - The list of course objects.
+         */
+        function calculateGrades(courses) {
+            const semesterData = {};
+            let cumulativeCredits = 0;
+            let cumulativeGradePoints = 0;
+
+            courses.forEach(course => {
+                const gp = gradeMap[course.grade] || 0;
+                const tgp = course.credits * gp; // Total Grade Points
+                
+                // Cumulative Calculation
+                cumulativeCredits += course.credits;
+                cumulativeGradePoints += tgp;
+
+                // Semester Calculation
+                if (!semesterData[course.semester]) {
+                    semesterData[course.semester] = { totalCredits: 0, totalGradePoints: 0, courses: [] };
+                }
+
+                semesterData[course.semester].totalCredits += course.credits;
+                semesterData[course.semester].totalGradePoints += tgp;
+                semesterData[course.semester].courses.push({ ...course, gradePoint: gp, totalGradePoints: tgp });
+            });
+
+            // Calculate SGPA for each semester
+            Object.keys(semesterData).forEach(sem => {
+                const data = semesterData[sem];
+                data.sgpa = data.totalCredits > 0 ? (data.totalGradePoints / data.totalCredits).toFixed(2) : '0.00';
+            });
+
+            // Calculate CGPA
+            const cgpa = cumulativeCredits > 0 ? (cumulativeGradePoints / cumulativeCredits).toFixed(2) : '0.00';
+
+            return { semesterData, cgpa, cumulativeCredits, cumulativeGradePoints };
+        }
+
+        /**
+         * Renders the courses and GPA summary to the DOM.
+         * @param {Array<Object>} courses - The list of course objects.
+         */
+        function renderUI(courses) {
+            const { semesterData, cgpa, cumulativeCredits } = calculateGrades(courses);
+            
+            // 1. Render CGPA Summary
+            document.getElementById('cgpa-value').textContent = cgpa;
+            document.getElementById('total-credits-value').textContent = cumulativeCredits.toFixed(1);
+
+            // 2. Render Semester-wise Breakdown
+            const breakdownContainer = document.getElementById('breakdown-container');
+            breakdownContainer.innerHTML = '';
+
+            const sortedSemesters = Object.keys(semesterData).sort((a, b) => parseInt(a) - parseInt(b));
+
+            sortedSemesters.forEach(sem => {
+                const semData = semesterData[sem];
+                const semCourses = semData.courses.sort((a, b) => a.timestamp - b.timestamp);
+
+                const semElement = document.createElement('div');
+                semElement.className = 'mb-6 p-4 bg-white/70 backdrop-blur-sm rounded-xl shadow-lg border border-gray-100';
+                
+                let courseRows = '';
+                semCourses.forEach(course => {
+                    courseRows += `
+                        <tr class="border-b border-gray-100 hover:bg-indigo-50 transition-colors">
+                            <td class="px-4 py-2 font-medium">${course.name}</td>
+                            <td class="px-4 py-2 text-center">${course.credits.toFixed(1)}</td>
+                            <td class="px-4 py-2 text-center">${course.grade} (${course.gradePoint})</td>
+                            <td class="px-4 py-2 text-center">${course.totalGradePoints.toFixed(1)}</td>
+                            <td class="px-4 py-2 text-center">
+                                <button onclick="deleteCourse('${course.id}')" class="text-red-500 hover:text-red-700 transition-colors p-1 rounded-full hover:bg-red-100">
+                                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-5 h-5">
+                                        <path fill-rule="evenodd" d="M8.75 1A2.75 2.75 0 0 0 6 3.75v.5H2.75a.75.75 0 0 0 0 1.5h.5v9.25c0 1.2.98 2.25 2.25 2.25h9.5c1.27 0 2.25-1.05 2.25-2.25V5.75h.5a.75.75 0 0 0 0-1.5H14v-.5A2.75 2.75 0 0 0 11.25 1h-2.5ZM10 12a.75.75 0 0 1-.75-.75V8.5a.75.75 0 0 1 1.5 0v2.75a.75.75 0 0 1-.75.75Zm.75-6.75a1.25 1.25 0 1 1-2.5 0 1.25 1.25 0 0 1 2.5 0ZM8.5 8.5a.75.75 0 0 0-1.5 0v2.75a.75.75 0 0 0 1.5 0v-2.75ZM13.25 8.5a.75.75 0 0 0-1.5 0v2.75a.75.75 0 0 0 1.5 0v-2.75Z" clip-rule="evenodd" />
+                                    </svg>
+                                </button>
+                            </td>
+                        </tr>
+                    `;
+                });
+
+                semElement.innerHTML = `
+                    <h3 class="text-xl font-bold text-gray-800 mb-2 border-b pb-2">
+                        Semester ${sem}
+                        <span class="ml-4 text-indigo-600 bg-indigo-50 px-3 py-1 rounded-full text-lg shadow-sm">
+                            SGPA: ${semData.sgpa}
+                        </span>
+                    </h3>
+                    <div class="overflow-x-auto">
+                        <table class="min-w-full divide-y divide-gray-200">
+                            <thead>
+                                <tr class="bg-gray-50 text-gray-600 uppercase text-sm leading-normal">
+                                    <th class="py-3 px-4 text-left">Course Name</th>
+                                    <th class="py-3 px-4 text-center">Credits</th>
+                                    <th class="py-3 px-4 text-center">Grade (GP)</th>
+                                    <th class="py-3 px-4 text-center">Total GP</th>
+                                    <th class="py-3 px-4 text-center">Action</th>
+                                </tr>
+                            </thead>
+                            <tbody class="text-gray-600 text-sm font-light">
+                                ${courseRows}
+                            </tbody>
+                        </table>
+                    </div>
+                `;
+                breakdownContainer.appendChild(semElement);
+            });
+        }
+
+        /**
+         * Starts listening for real-time updates from Firestore.
+         */
+        function startListeningForCourses() {
+            if (!db || !userId) {
+                console.warn("Database or User ID not available for listening.");
+                return;
+            }
+
+            // Private data storage: /artifacts/{appId}/users/{userId}/courses
+            const courseCollectionPath = `artifacts/${appId}/users/${userId}/courses`;
+            const q = query(collection(db, courseCollectionPath), orderBy("timestamp", "asc"));
+
+            onSnapshot(q, (snapshot) => {
+                const courses = [];
+                snapshot.forEach(doc => {
+                    courses.push({ id: doc.id, ...doc.data() });
+                });
+                renderUI(courses);
+            }, (error) => {
+                console.error("Error listening to courses:", error);
+                document.getElementById('app-status').textContent = `Data Error: ${error.message}`;
+            });
+        }
+
+        /**
+         * Adds a new course to Firestore.
+         */
+        window.addCourse = async function() {
+            if (!userId) {
+                showModal("Authorization Required", "Please log in to add courses.");
+                return;
+            }
+            
+            const semester = document.getElementById('semester-input').value;
+            const courseName = document.getElementById('course-name-input').value.trim();
+            const credits = parseFloat(document.getElementById('credits-input').value);
+            const grade = document.getElementById('grade-input').value;
+
+            // Simple validation
+            if (!courseName || isNaN(credits) || credits <= 0 || !grade) {
+                showModal("Validation Error", "Please ensure all fields are filled correctly. Credits must be a positive number.");
+                return;
+            }
+            if (!gradeMap[grade]) {
+                 showModal("Validation Error", `Grade '${grade}' is not a valid grade.`);
+                 return;
+            }
+            
+            const newCourse = {
+                semester: parseInt(semester),
+                name: courseName,
+                credits: credits,
+                grade: grade,
+                timestamp: Date.now()
+            };
+
+            try {
+                const courseCollectionPath = `artifacts/${appId}/users/${userId}/courses`;
+                await addDoc(collection(db, courseCollectionPath), newCourse);
+                
+                // Clear input fields after successful addition
+                document.getElementById('course-name-input').value = '';
+                document.getElementById('credits-input').value = '3.0';
+
+            } catch (error) {
+                console.error("Error adding course:", error);
+                showModal("Database Error", `Failed to add course: ${error.message}`);
+            }
+        }
+
+        /**
+         * Deletes a course from Firestore.
+         * @param {string} courseId - The ID of the course document to delete.
+         */
+        window.deleteCourse = async function(courseId) {
+            if (!userId) return; // Prevent action if not logged in
+            
+            // Confirmation is handled by the custom modal logic
+            if (!confirmAction.show('Confirm Deletion', 'Are you sure you want to delete this course?', async () => {
+                try {
+                    const courseCollectionPath = `artifacts/${appId}/users/${userId}/courses`;
+                    await deleteDoc(doc(db, courseCollectionPath, courseId));
+                } catch (error) {
+                    console.error("Error deleting course:", error);
+                    showModal("Database Error", `Failed to delete course: ${error.message}`);
+                }
+            })) {
+                return;
+            }
+        }
+
+        // --- Custom Modal and Confirmation Logic (No alert/confirm) ---
+
+        const modal = document.getElementById('custom-modal');
+        const modalTitle = document.getElementById('modal-title');
+        const modalMessage = document.getElementById('modal-message');
+        const modalActions = document.getElementById('modal-actions');
+
+        function hideModal() {
+            modal.classList.add('hidden');
+        }
+
+        window.showModal = function(title, message, confirmCallback = null) {
+            modalTitle.textContent = title;
+            modalMessage.textContent = message;
+            modalActions.innerHTML = '';
+
+            const closeButton = document.createElement('button');
+            closeButton.className = 'px-4 py-2 bg-indigo-600 text-white font-medium rounded-lg hover:bg-indigo-700 transition-colors shadow-md';
+            closeButton.textContent = 'Close';
+            closeButton.onclick = hideModal;
+            modalActions.appendChild(closeButton);
+
+            if (confirmCallback) {
+                const confirmButton = document.createElement('button');
+                confirmButton.className = 'px-4 py-2 bg-red-600 text-white font-medium rounded-lg hover:bg-red-700 transition-colors shadow-md ml-3';
+                confirmButton.textContent = 'Confirm';
+                confirmButton.onclick = () => {
+                    hideModal();
+                    confirmCallback();
+                };
+                modalActions.appendChild(confirmButton);
+            }
+
+            modal.classList.remove('hidden');
+        }
+
+        // A simplified wrapper for window.confirm replacement
+        const confirmAction = {
+            show: (title, message, callback) => {
+                showModal(title, message, callback);
+                return true; // Return true to indicate modal was shown
+            }
+        };
+
+
+        // --- Initialization ---
+        window.onload = initializeFirebase;
+    </script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+        body {
+            font-family: 'Inter', sans-serif;
+            background: linear-gradient(135deg, #f0f4f8 0%, #d9e2ec 100%);
+            min-height: 100vh;
+        }
+        /* Custom scrollbar for better aesthetics */
+        ::-webkit-scrollbar {
+            width: 8px;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #9ca3af;
+            border-radius: 10px;
+        }
+        ::-webkit-scrollbar-track {
+            background: #e5e7eb;
+        }
+    </style>
+</head>
+<body class="p-4 sm:p-8">
+
+    <!-- Authentication Form Container (Shown when logged out) -->
+    <div id="auth-container" class="max-w-md mx-auto mt-16 p-8 bg-white rounded-2xl shadow-2xl border-t-4 border-indigo-600 hidden">
+        <h2 id="auth-title" class="text-3xl font-bold text-gray-900 mb-6 text-center">Login to your Account</h2>
+        <p id="auth-message" class="text-sm text-red-500 font-medium mb-4"></p>
+        
+        <div id="signup-fields" class="space-y-4 mb-4 hidden">
+             <div>
+                <label for="signup-name" class="block text-sm font-medium text-gray-700">Full Name (Mandatory)</label>
+                <input type="text" id="signup-name" placeholder="John Doe" required class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 p-3 border">
+            </div>
+            <div>
+                <label for="signup-regno" class="block text-sm font-medium text-gray-700">Registration Number (Mandatory)</label>
+                <input type="text" id="signup-regno" placeholder="e.g., 19BECxxxx" required class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 p-3 border">
+            </div>
+        </div>
+
+        <div class="space-y-4 mb-6">
+            <div>
+                <label for="auth-email" class="block text-sm font-medium text-gray-700">Email Address (Mandatory)</label>
+                <input type="email" id="auth-email" placeholder="you@example.com" required class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 p-3 border">
+            </div>
+            <div>
+                <label for="auth-password" class="block text-sm font-medium text-gray-700">Password (Min 6 characters)</label>
+                <input type="password" id="auth-password" required class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 p-3 border">
+            </div>
+        </div>
+        
+        <button id="auth-submit-btn" class="w-full px-6 py-3 bg-indigo-600 text-white font-semibold rounded-lg shadow-md hover:bg-indigo-700 transition-colors focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2">
+            Login
+        </button>
+
+        <p id="auth-toggle-link" class="mt-6 text-center text-sm text-gray-600">
+            <!-- Toggle link inserted by JS -->
+        </p>
+    </div>
+
+    <!-- Main Application Container (Shown when logged in) -->
+    <div id="main-app-container" class="max-w-6xl mx-auto hidden">
+        <!-- Header and Summary -->
+        <header class="mb-8 p-6 bg-white rounded-2xl shadow-xl border-t-4 border-indigo-600">
+            <div class="flex justify-between items-start mb-4">
+                <div>
+                    <h1 class="text-3xl font-extrabold text-gray-900 mb-1 flex items-center">
+                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-8 h-8 mr-3 text-indigo-600">
+                            <path d="M11.7 2.875A.75.75 0 0 1 12 3.75v16.5a.75.75 0 0 1-1.294.577l-2.486-2.302A.75.75 0 0 1 8 18h-1.5A2.25 2.25 0 0 1 4.25 15.75V8.25A2.25 2.25 0 0 1 6.5 6H8a.75.75 0 0 1 .706-.577l2.486-2.302Z" />
+                            <path fill-rule="evenodd" d="M15.5 6.75a2.25 2.25 0 0 0-2.25 2.25v4.5c0 1.24.965 2.25 2.25 2.25s2.25-1.01 2.25-2.25V9a2.25 2.25 0 0 0-2.25-2.25Zm.16 3.864a.75.75 0 0 0-1.272-.731 28.537 28.537 0 0 0-1.07 3.991.75.75 0 0 0 .809.827c.452-.07.86-.29 1.144-.645a.75.75 0 0 0-.256-1.168Z" clip-rule="evenodd" />
+                            <path d="M15.5 3A.75.75 0 0 0 15 3.75v1.252A4.25 4.25 0 0 0 13.25 6H8a.75.75 0 0 0-.75.75v10.5c0 .414.336.75.75.75h4.94a4.25 4.25 0 0 0 3.72-1.928V15.75a2.25 2.25 0 0 0 2.25-2.25V9a2.25 2.25 0 0 0-2.25-2.25V3.75A.75.75 0 0 0 15.5 3Z" />
+                        </svg>
+                        CGPA Progress Tracker
+                    </h1>
+                    <div id="profile-info" class="text-sm text-gray-500 mb-2"></div>
+                    <p id="user-id-display" class="text-xs text-gray-400"></p>
+                </div>
+                <div class="flex flex-col space-y-2">
+                    <button onclick="exportUserProfile()" class="text-sm px-4 py-2 bg-green-500 text-white font-medium rounded-lg shadow-md hover:bg-green-600 transition-colors flex items-center">
+                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-4 h-4 mr-1">
+                          <path d="M12.232 4.232a.5.5 0 0 1-.5.5H7.5v6.5h3.5a.5.5 0 0 1 0 1h-3.5v3.5a.5.5 0 0 1-1 0v-3.5H4.268a.5.5 0 0 1 0-1h3.5V5.232H4.268a.5.5 0 0 1-.5-.5H7.5a.5.5 0 0 0 .5-.5V1.232a.5.5 0 0 1 1 0v2.5a.5.5 0 0 0 .5.5h2.232a.5.5 0 0 1 .5.5ZM17 9.5a.5.5 0 0 1 .5.5v7.5a.5.5 0 0 1-.5.5H3a.5.5 0 0 1-.5-.5V9.5a.5.5 0 0 1 .5-.5h14ZM4.5 9.5a.5.5 0 0 0-.5.5v7.5a.5.5 0 0 0 .5.5h11a.5.5 0 0 0 .5-.5V9.5a.5.5 0 0 0-.5-.5h-11Z" clip-rule="evenodd" />
+                          <path fill-rule="evenodd" d="M10 18a.5.5 0 0 1-.5.5H3a.5.5 0 0 1-.5-.5V9.5a.5.5 0 0 1 .5-.5h7a.5.5 0 0 1 .5.5v8.5Z" clip-rule="evenodd" />
+                        </svg>
+                        Export Profile (CSV)
+                    </button>
+                    <button onclick="handleSignOut()" class="text-sm px-4 py-2 bg-red-500 text-white font-medium rounded-lg shadow-md hover:bg-red-600 transition-colors">
+                        Sign Out
+                    </button>
+                </div>
+            </div>
+            
+            <div class="flex flex-wrap gap-4">
+                <div class="p-4 bg-indigo-50 border border-indigo-200 rounded-lg shadow-inner flex-1 min-w-[150px]">
+                    <p class="text-sm font-medium text-indigo-700">Overall CGPA</p>
+                    <p id="cgpa-value" class="text-3xl font-bold text-indigo-600 mt-1">--</p>
+                </div>
+                <div class="p-4 bg-gray-50 border border-gray-200 rounded-lg shadow-inner flex-1 min-w-[150px]">
+                    <p class="text-sm font-medium text-gray-700">Total Credits Earned</p>
+                    <p id="total-credits-value" class="text-3xl font-bold text-gray-600 mt-1">--</p>
+                </div>
+            </div>
+            <p id="app-status" class="text-xs mt-3 text-red-500 font-medium">Initializing...</p>
+        </header>
+
+        <!-- Course Entry Form -->
+        <div class="mb-8 p-6 bg-white rounded-2xl shadow-xl border-l-4 border-blue-500">
+            <h2 class="text-2xl font-bold text-gray-800 mb-4">Add New Course</h2>
+            <div class="grid grid-cols-1 md:grid-cols-5 gap-4">
+                <div class="md:col-span-2">
+                    <label for="course-name-input" class="block text-sm font-medium text-gray-700">Course Name</label>
+                    <input type="text" id="course-name-input" placeholder="e.g., Data Structures" class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 p-2 border">
+                </div>
+                <div>
+                    <label for="semester-input" class="block text-sm font-medium text-gray-700">Semester</label>
+                    <select id="semester-input" class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 p-2 border bg-white">
+                        <option value="1">1st Semester</option>
+                        <option value="2">2nd Semester</option>
+                        <option value="3">3rd Semester</option>
+                        <option value="4">4th Semester</option>
+                        <option value="5">5th Semester</option>
+                        <option value="6">6th Semester</option>
+                        <option value="7">7th Semester</option>
+                        <option value="8">8th Semester</option>
+                    </select>
+                </div>
+                <div>
+                    <label for="credits-input" class="block text-sm font-medium text-gray-700">Credits</label>
+                    <input type="number" id="credits-input" value="3.0" step="0.5" min="0.5" class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 p-2 border">
+                </div>
+                <div>
+                    <label for="grade-input" class="block text-sm font-medium text-gray-700">Grade</label>
+                    <select id="grade-input" class="mt-1 block w-full rounded-lg border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 p-2 border bg-white">
+                        <option value="S">S (10 GP)</option>
+                        <option value="A" selected>A (9 GP)</option>
+                        <option value="B">B (8 GP)</option>
+                        <option value="C">C (7 GP)</option>
+                        <option value="D">D (6 GP)</option>
+                        <option value="E">E (5 GP)</option>
+                        <option value="P">P (4 GP)</option>
+                        <option value="F">F (0 GP)</option>
+                        <option value="I">I (Incomplete/0 GP)</option>
+                        <option value="W">W (Withdrawal/0 GP)</option>
+                    </select>
+                </div>
+            </div>
+            <div class="mt-6">
+                <button onclick="addCourse()" class="w-full md:w-auto px-6 py-3 bg-blue-600 text-white font-semibold rounded-lg shadow-md hover:bg-blue-700 transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2">
+                    Add Course & Calculate
+                </button>
+            </div>
+        </div>
+
+        <!-- Course Breakdown -->
+        <div class="p-6 bg-white rounded-2xl shadow-xl">
+            <h2 class="text-2xl font-bold text-gray-800 mb-4 border-b pb-2">Semester Breakdown</h2>
+            <div id="breakdown-container">
+                <p class="text-gray-500 text-center py-8">Start adding courses to see your grades here.</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Custom Modal Structure -->
+    <div id="custom-modal" class="fixed inset-0 bg-gray-600 bg-opacity-75 hidden flex items-center justify-center p-4 z-50 transition-opacity duration-300">
+        <div class="bg-white rounded-xl shadow-2xl p-6 w-full max-w-sm transform transition-transform duration-300 scale-100">
+            <h3 id="modal-title" class="text-xl font-bold text-gray-800 mb-3">Modal Title</h3>
+            <p id="modal-message" class="text-gray-600 mb-6">Modal Message</p>
+            <div id="modal-actions" class="flex justify-end space-x-3">
+                <!-- Buttons will be injected here by JavaScript -->
+            </div>
+        </div>
+    </div>
+</body>
+</html>
